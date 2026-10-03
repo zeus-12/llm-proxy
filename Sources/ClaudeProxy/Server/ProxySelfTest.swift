@@ -274,14 +274,40 @@ enum ProxySelfTest {
 
         print("ProxySelfTest — tool-aware streaming")
 
-        check("plain text streams immediately",
-              ToolStreamClassifier.classify("Hello") == .text)
-        check("leading whitespace waits for a decision",
-              ToolStreamClassifier.classify("  \n") == .undecided)
-        check("JSON tool envelope stays buffered",
-              ToolStreamClassifier.classify(#" {"tool_calls":[]}"#) == .toolCandidate)
-        check("fenced tool envelope stays buffered",
-              ToolStreamClassifier.classify("```json\n{") == .toolCandidate)
+        do {
+            let names: Set<String> = ["calendar_events"]
+            let directive = #"{"tool_calls": [{"name": "calendar_events", "arguments": {"from": "a"}}]}"#
+            func split(_ deltas: [String]) -> (sent: String, held: String, calls: [ToolCall]?) {
+                var splitter = DirectiveStreamSplitter(functionNames: names)
+                let sent = deltas.map { splitter.feed($0) }.joined()
+                let (held, calls) = splitter.finish()
+                return (sent, held, calls)
+            }
+
+            check("plain text streams immediately", split(["Hello"]).sent == "Hello")
+            check("whitespace waits for a decision", split(["  \n"]).sent == "")
+            let atStart = split([directive])
+            check("directive at the start becomes a call",
+                  atStart.sent == "" && atStart.calls?.first?.function.name == "calendar_events")
+            check("call keeps its arguments", atStart.calls?.first?.function.arguments == #"{"from":"a"}"#)
+            let afterProse = split(["Checking your calendar.\n", directive])
+            check("directive after prose becomes a call",
+                  afterProse.sent == "Checking your calendar." && afterProse.calls?.count == 1)
+            let fenced = split(["Sure:\n```json\n", directive, "\n```"])
+            check("fenced directive after prose becomes a call", fenced.calls?.count == 1)
+            let chopped = split(["{", "\n \"to", "ol_calls\": [{\"name\": \"calendar_", "events\", \"arguments\": {}}]}"])
+            check("directive split across deltas becomes a call", chopped.sent == "" && chopped.calls?.count == 1)
+            let example = split([#"Example: {"name": "Alice"}"#])
+            check("JSON naming no supplied function stays text",
+                  example.calls == nil && example.sent + example.held == #"Example: {"name": "Alice"}"#)
+            let unknown = split([#"{"tool_calls": [{"name": "rm_rf", "arguments": {}}]}"#])
+            check("unknown function is not called", unknown.calls == nil)
+            let code = "Run:\n```python\nprint({'a': 1})\n```"
+            let fence = split([code])
+            check("code fences stay text", fence.calls == nil && fence.sent + fence.held == code)
+            check("code fence streams before its close", fence.sent.hasPrefix("Run:\n```python\nprint({'a': 1})"))
+            check("braces in prose stream as text", split(["a {b} c"]).sent == "a {b} c")
+        }
 
         print("ProxySelfTest — provider routing")
 

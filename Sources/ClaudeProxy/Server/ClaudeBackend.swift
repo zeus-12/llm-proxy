@@ -248,7 +248,8 @@ enum ClaudeBackend {
     /// tool-call response (i.e. the model replied with plain text). Tolerant of
     /// markdown fences and surrounding whitespace; accepts the `tool_calls` array
     /// form, a single `tool_call` object, or a bare `{name, arguments}` object.
-    static func parseToolCalls(_ raw: String) -> [ToolCall]? {
+    /// Entries naming a function the caller didn't supply are dropped.
+    static func parseToolCalls(_ raw: String, functionNames: Set<String>) -> [ToolCall]? {
         let candidate = extractJSONObject(from: raw)
         guard let data = candidate.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -267,7 +268,7 @@ enum ClaudeBackend {
         }
 
         let calls: [ToolCall] = entries.compactMap { entry in
-            guard let name = entry["name"] as? String, !name.isEmpty else { return nil }
+            guard let name = entry["name"] as? String, functionNames.contains(name) else { return nil }
             let argsString: String
             if let s = entry["arguments"] as? String {
                 argsString = s

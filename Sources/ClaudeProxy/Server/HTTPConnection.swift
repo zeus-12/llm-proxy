@@ -1,20 +1,81 @@
 import Foundation
 import Network
 
-enum ToolStreamClassification: Equatable {
-    case undecided
-    case text
-    case toolCandidate
-}
+/// Finds a tool-call directive wherever it starts in a reply, including after
+/// prose or inside a code fence. Text is released as soon as it cannot be the
+/// start of a directive; only that ambiguous stretch, and trailing whitespace,
+/// is held back.
+struct DirectiveStreamSplitter {
+    private enum Prefix { case directive, undecided, text }
 
-/// Tool calls arrive as a JSON envelope, so only that small ambiguous prefix
-/// must be held back. Ordinary prose can be forwarded as soon as its first
-/// non-whitespace character proves it is not a tool envelope.
-enum ToolStreamClassifier {
-    static func classify(_ prefix: String) -> ToolStreamClassification {
-        let trimmed = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = trimmed.first else { return .undecided }
-        return first == "{" || first == "`" ? .toolCandidate : .text
+    private let functionNames: Set<String>
+    private var pending = ""
+    private var holdingDirective = false
+
+    init(functionNames: Set<String>) {
+        self.functionNames = functionNames
+    }
+
+    /// Returns the text that is now safe to send.
+    mutating func feed(_ delta: String) -> String {
+        pending += delta
+        guard !holdingDirective else { return "" }
+        var ready = ""
+        while let start = pending.firstIndex(where: { $0 == "{" || $0 == "`" }) {
+            let gap = Self.trailingWhitespaceStart(pending[..<start])
+            ready += pending[..<gap]
+            pending = String(pending[gap...])
+            let candidate = pending.drop(while: \.isWhitespace)
+            switch Self.classify(candidate) {
+            case .directive:
+                holdingDirective = true
+                return ready
+            case .undecided:
+                return ready
+            case .text:
+                let next = pending.index(after: candidate.startIndex)
+                ready += pending[..<next]
+                pending = String(pending[next...])
+            }
+        }
+        let end = Self.trailingWhitespaceStart(pending[...])
+        ready += pending[..<end]
+        pending = String(pending[end...])
+        return ready
+    }
+
+    private static func trailingWhitespaceStart(_ text: Substring) -> String.Index {
+        text.lastIndex(where: { !$0.isWhitespace }).map { text.index(after: $0) } ?? text.startIndex
+    }
+
+    /// The calls, if the held text was a directive naming the caller's functions;
+    /// otherwise the held text, to send as it is.
+    mutating func finish() -> (text: String, calls: [ToolCall]?) {
+        defer { pending = "" }
+        if holdingDirective,
+           let calls = ClaudeBackend.parseToolCalls(pending, functionNames: functionNames) {
+            return ("", calls)
+        }
+        return (pending, nil)
+    }
+
+    private static func classify(_ text: Substring) -> Prefix {
+        var rest = text
+        if rest.first == "`" {
+            let fence = "```"
+            guard rest.count >= fence.count else { return fence.hasPrefix(rest) ? .undecided : .text }
+            guard rest.hasPrefix(fence) else { return .text }
+            rest = rest.dropFirst(fence.count).drop(while: \.isLetter).drop(while: \.isWhitespace)
+            if rest.isEmpty { return .undecided }
+        }
+        guard rest.first == "{" else { return .text }
+        rest = rest.dropFirst().drop(while: \.isWhitespace)
+        if rest.isEmpty { return .undecided }
+        for key in [#""tool_calls""#, #""tool_call""#, #""name""#] {
+            if rest.hasPrefix(key) { return .directive }
+            if key.hasPrefix(rest) { return .undecided }
+        }
+        return .text
     }
 }
 
@@ -155,6 +216,7 @@ final class HTTPConnection {
         // Tool calling: a JSON-looking response must be inspected as a complete
         // envelope, but ordinary prose can still stream through immediately.
         let toolsActive = ClaudeBackend.functionsActive(tools: decoded.tools, toolChoice: decoded.tool_choice)
+        let functionNames = Set(decoded.tools?.map(\.function.name) ?? [])
 
         guard let chatModel = ChatModel(rawValue: model), chatModel.backend == backend else {
             writeError(status: 400, message: "Unsupported model \(model)")
@@ -181,9 +243,9 @@ final class HTTPConnection {
         }
 
         if toolsActive && wantsStream {
-            streamToolAware(result, model: model)
+            streamToolAware(result, model: model, functionNames: functionNames)
         } else if toolsActive {
-            collectToolAware(result, model: model)
+            collectToolAware(result, model: model, functionNames: functionNames)
         } else if wantsStream {
             streamChat(result, model: model)
         } else {
@@ -193,7 +255,7 @@ final class HTTPConnection {
 
     /// Non-streaming tool-aware responses still need the complete output before
     /// choosing between a message and an OpenAI-compatible tool call.
-    private func collectToolAware(_ result: ChatStreamResult, model: String) {
+    private func collectToolAware(_ result: ChatStreamResult, model: String, functionNames: Set<String>) {
         Task {
             var text = ""
             do {
@@ -204,11 +266,13 @@ final class HTTPConnection {
                 writeError(status: 502, message: error.localizedDescription)
                 return
             }
-            let calls = ClaudeBackend.parseToolCalls(text)
+            var splitter = DirectiveStreamSplitter(functionNames: functionNames)
+            let lead = splitter.feed(text)
+            let (_, calls) = splitter.finish()
             let message: ChatCompletionResponse.Message
             let finish: String
             if let calls {
-                message = .init(content: nil, tool_calls: calls)
+                message = .init(content: lead.isEmpty ? nil : lead, tool_calls: calls)
                 finish = "tool_calls"
             } else {
                 message = .init(content: text, tool_calls: nil)
@@ -224,7 +288,7 @@ final class HTTPConnection {
 
     /// Streams prose immediately even when the client supplied tools. Only a
     /// JSON/fenced prefix remains buffered until it can be parsed as a tool call.
-    private func streamToolAware(_ result: ChatStreamResult, model: String) {
+    private func streamToolAware(_ result: ChatStreamResult, model: String, functionNames: Set<String>) {
         let id = OpenAIIDs.chatID()
         let created = OpenAIIDs.now
         writeRaw(status: 200, headers: sseHeaders, body: Data(), keepOpen: true)
@@ -233,27 +297,18 @@ final class HTTPConnection {
             sendChunk(id: id, created: created, model: model,
                       delta: .init(role: "assistant"), finish: nil)
 
-            var buffered = ""
-            var classification = ToolStreamClassification.undecided
+            var splitter = DirectiveStreamSplitter(functionNames: functionNames)
             do {
                 for try await delta in result.deltas {
-                    if classification == .text {
+                    let ready = splitter.feed(delta)
+                    if !ready.isEmpty {
                         sendChunk(id: id, created: created, model: model,
-                                  delta: .init(content: delta), finish: nil)
-                        continue
-                    }
-
-                    buffered += delta
-                    classification = ToolStreamClassifier.classify(buffered)
-                    if classification == .text {
-                        sendChunk(id: id, created: created, model: model,
-                                  delta: .init(content: buffered), finish: nil)
-                        buffered = ""
+                                  delta: .init(content: ready), finish: nil)
                     }
                 }
 
-                if classification == .toolCandidate,
-                   let calls = ClaudeBackend.parseToolCalls(buffered) {
+                let (held, calls) = splitter.finish()
+                if let calls {
                     let deltas = calls.enumerated().map { index, call in
                         ChatCompletionChunk.ToolCallDelta(
                             index: index, id: call.id,
@@ -266,9 +321,9 @@ final class HTTPConnection {
                     sendChunk(id: id, created: created, model: model,
                               delta: .init(), finish: "tool_calls")
                 } else {
-                    if !buffered.isEmpty {
+                    if !held.isEmpty {
                         sendChunk(id: id, created: created, model: model,
-                                  delta: .init(content: buffered), finish: nil)
+                                  delta: .init(content: held), finish: nil)
                     }
                     sendChunk(id: id, created: created, model: model,
                               delta: .init(), finish: "stop")
