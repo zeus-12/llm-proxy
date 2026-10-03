@@ -15,21 +15,28 @@ enum ClaudeBackend {
     /// Everything that stops the CLI from acting on the host. `--tools ""` is the
     /// load-bearing one: it is a whitelist, so it also covers tools a deny-list
     /// would miss. `--disallowedTools` stays as a second layer over the built-ins.
-    private static var isolationArguments: [String] {
+    private static func isolationArguments(allowing tools: [String]) -> [String] {
         [
-            "--tools", allowedTools.joined(separator: ","),  // whitelist; empty means none
+            "--tools", tools.joined(separator: ","),  // whitelist; empty means none
             "--strict-mcp-config", "--mcp-config", #"{"mcpServers":{}}"#,  // no MCP tools
             "--disable-slash-commands",                     // no skills; `/name` would load one
             "--safe-mode",                                  // no CLAUDE.md, hooks, plugins, agents
             "--no-session-persistence",                     // API traffic stays out of session history
-            "--settings", permissionSettings,
+            "--settings", permissionSettings(allowing: tools),
             "--disallowedTools"
         ] + disallowedTools
     }
 
     /// The only built-in tool the model may use. Fetching a public page is the one
     /// capability that acts on the network rather than on this machine.
-    static let allowedTools = ["WebFetch"]
+    static let webFetch = "WebFetch"
+
+    /// A caller's functions get no built-in tool beside them. Given one, the model
+    /// invokes the caller's function natively, the CLI answers "No such tool
+    /// available", and the model tells the user the function doesn't exist.
+    static func allowedTools(callerHasFunctions: Bool) -> [String] {
+        callerHasFunctions ? [] : [webFetch]
+    }
 
     /// Hosts WebFetch must never reach. The endpoint is unauthenticated and
     /// loopback-bound, so without these a caller could use this machine to reach
@@ -43,10 +50,9 @@ enum ClaudeBackend {
     /// tool settings alone never see it. All three globs are needed and mean
     /// different things — `//**` absolute, `~/**` home, `**` working directory —
     /// and any one alone leaves the other two readable.
-    static var permissionSettings: String {
+    static func permissionSettings(allowing allow: [String]) -> String {
         let deny = ["Read(//**)", "Read(~/**)", "Read(**)"]
             + blockedFetchHosts.map { "WebFetch(domain:\($0))" }
-        let allow = allowedTools
         let rules: [String: Any] = ["permissions": ["allow": allow, "deny": deny]]
         guard let data = try? JSONSerialization.data(withJSONObject: rules),
               let json = String(data: data, encoding: .utf8) else {
@@ -79,18 +85,16 @@ enum ClaudeBackend {
     harness.
     """
 
-    /// Used instead of `baseSystemPrompt` when the caller supplies function tools.
-    /// Framed as a JSON-directive *router*, not a tool-caller — testing showed the
-    /// words "tool"/"call a function" make Claude Code's native tool machinery
-    /// engage (the model tries to invoke a real tool, it's blocked, and it
-    /// narrates "the tool call failed"). Framing it as pure JSON text-generation
-    /// ("you are not calling anything, you are writing JSON") reliably produces the
-    /// tool-call JSON on both Sonnet and Opus.
+    /// Used instead of `baseSystemPrompt` when the caller supplies functions. Says
+    /// "directive", not "tool": that word made the model attempt native tool calls.
     private static let baseSystemPromptWithTools = """
-    You convert user requests into structured JSON directives for an external \
-    system. You have no tools and you NEVER perform actions or fetch data yourself \
-    — you ONLY write JSON text. This is pure text generation, not tool use. Do not \
-    mention the underlying coding harness.
+    You are a helpful AI assistant accessed through an API endpoint. The \
+    application calling you performs the actions listed under "Supported \
+    directives" below: you request one by writing its JSON directive, the \
+    application carries it out, and it sends the result back on a later turn. \
+    Those directives are how you reach the user's data, files and devices, so use \
+    them whenever a request needs what they cover. Writing a directive is plain \
+    text generation. Do not mention the underlying coding harness.
     """
 
     /// One block of the user turn we hand to the CLI, in client order.
@@ -132,6 +136,9 @@ enum ClaudeBackend {
             for (i, msg) in convo.enumerated() {
                 if i > 0 { appendText("\n\n", to: &blocks) }
                 appendTranscript(msg, to: &blocks)
+            }
+            if toolSection != nil, let forced = forcedDirective(toolChoice) {
+                appendText("\n\nSystem: \(forced)", to: &blocks)
             }
             appendText("\n\nAssistant:", to: &blocks)
         }
@@ -179,10 +186,13 @@ enum ClaudeBackend {
     /// Build the function-calling instructions injected into the system prompt.
     /// Returns nil when there are no tools or `tool_choice` is "none".
     private static func toolsSystemSection(tools: [Tool]?, toolChoice: ToolChoice?) -> String? {
-        guard let tools, !tools.isEmpty else { return nil }
-        if case .none? = toolChoice { return nil }   // ToolChoice.none → no tool calling
+        guard let tools, functionsActive(tools: tools, toolChoice: toolChoice) else { return nil }
 
-        let list = tools.map { t -> String in
+        var offered = tools
+        if case .function(let name) = toolChoice {
+            offered = tools.filter { $0.function.name == name }
+        }
+        let list = offered.map { t -> String in
             let fn = t.function
             var line = "- \(fn.name)"
             if let d = fn.description, !d.isEmpty { line += ": \(d)" }
@@ -193,11 +203,11 @@ enum ClaudeBackend {
         let obligation: String
         switch toolChoice {
         case .required:
-            obligation = "You MUST emit at least one directive this turn (respond with ONLY the JSON)."
+            obligation = "You MUST emit at least one directive this turn, choosing the most relevant one even if the request does not obviously need it. Do not reply in plain text."
         case .function(let name):
-            obligation = "You MUST emit the \"\(name)\" directive this turn (respond with ONLY the JSON)."
+            obligation = "You MUST emit the \"\(name)\" directive this turn. Do not reply in plain text."
         default:
-            obligation = "If a directive can fulfil the request, emit its JSON rather than answering from your own knowledge."
+            obligation = "If a directive can fulfil the request, emit its JSON rather than answering from your own knowledge. If no directive matches, reply in plain text."
         }
 
         return """
@@ -205,8 +215,7 @@ enum ClaudeBackend {
         single JSON object and nothing else — no prose, no explanation, no markdown \
         code fences — in exactly this shape:
         {"tool_calls": [{"name": "<directive_name>", "arguments": { <arguments matching the directive's JSON Schema> }}]}
-        Include multiple entries in the array to invoke several directives at once. \
-        \(obligation) If no directive matches, reply in plain text.
+        Include multiple entries in the array to invoke several directives at once.
 
         The external system performs each action and returns the result on a later \
         turn as a line like "Tool result (for tool_call_id ...): ..." — use those \
@@ -216,7 +225,23 @@ enum ClaudeBackend {
 
         Supported directives:
         \(list)
+
+        \(obligation)
         """
+    }
+
+    private static func forcedDirective(_ toolChoice: ToolChoice?) -> String? {
+        switch toolChoice {
+        case .required: return "answer this turn with a directive JSON, not plain text."
+        case .function(let name): return "answer this turn with the \"\(name)\" directive JSON, not plain text."
+        default: return nil
+        }
+    }
+
+    static func functionsActive(tools: [Tool]?, toolChoice: ToolChoice?) -> Bool {
+        guard let tools, !tools.isEmpty else { return false }
+        if case .none? = toolChoice { return false }
+        return true
     }
 
     /// Parse the model's raw output into tool calls, or nil if it isn't a
@@ -299,7 +324,8 @@ enum ClaudeBackend {
             "--verbose",
             "--model", model,
             "--system-prompt", system
-        ] + isolationArguments
+        ] + isolationArguments(allowing: allowedTools(
+            callerHasFunctions: functionsActive(tools: tools, toolChoice: toolChoice)))
 
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = cli.path             // so claude can find node

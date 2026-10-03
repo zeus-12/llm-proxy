@@ -410,7 +410,7 @@ enum ProxySelfTest {
         // The live suite proves these hold against the real CLI; these catch a
         // rule being dropped or mistyped without waiting on a network run.
         do {
-            let settings = ClaudeBackend.permissionSettings
+            let settings = ClaudeBackend.permissionSettings(allowing: ClaudeBackend.allowedTools(callerHasFunctions: false))
             let parsed = jsonObject(settings)?["permissions"] as? [String: Any]
             let deny = parsed?["deny"] as? [String] ?? []
             let allow = parsed?["allow"] as? [String] ?? []
@@ -424,7 +424,37 @@ enum ProxySelfTest {
             check("denies localhost fetch", deny.contains("WebFetch(domain:localhost)"))
             check("denies link-local fetch", deny.contains("WebFetch(domain:169.254.169.254)"))
             check("allows WebFetch", allow == ["WebFetch"])
-            check("WebFetch is the only tool", ClaudeBackend.allowedTools == ["WebFetch"])
+            check("WebFetch is the only tool", ClaudeBackend.allowedTools(callerHasFunctions: false) == ["WebFetch"])
+            check("no built-in tool beside caller functions", ClaudeBackend.allowedTools(callerHasFunctions: true).isEmpty)
+
+            let withFunctions = jsonObject(ClaudeBackend.permissionSettings(allowing: []))?["permissions"] as? [String: Any]
+            check("caller functions allow nothing", (withFunctions?["allow"] as? [String]) == [])
+            check("caller functions keep read denial", (withFunctions?["deny"] as? [String] ?? []).contains("Read(//**)"))
+
+            let calendar = Tool(type: "function", function: .init(name: "calendar_events", description: nil, parameters: nil, strict: nil))
+            check("functions active with tools", ClaudeBackend.functionsActive(tools: [calendar], toolChoice: nil))
+            check("functions inactive under tool_choice none", !ClaudeBackend.functionsActive(tools: [calendar], toolChoice: ToolChoice.none))
+            check("functions inactive without tools", !ClaudeBackend.functionsActive(tools: [], toolChoice: .required))
+        }
+
+        print("ProxySelfTest — tool_choice shapes the directive prompt")
+
+        do {
+            let tools = ["calendar_events", "search_notes"].map {
+                Tool(type: "function", function: .init(name: $0, description: nil, parameters: nil, strict: nil))
+            }
+            let user = (try? JSONDecoder().decode([ChatMessage].self,
+                                                  from: Data(#"[{"role":"user","content":"hello"}]"#.utf8))) ?? []
+            let auto = ClaudeBackend.buildPrompt(user, tools: tools).system
+            let required = ClaudeBackend.buildPrompt(user, tools: tools, toolChoice: .required).system
+            let named = ClaudeBackend.buildPrompt(user, tools: tools, toolChoice: .function(name: "search_notes")).system
+
+            check("auto lists every function", auto.contains("- calendar_events") && auto.contains("- search_notes"))
+            check("auto allows a plain-text reply", auto.contains("reply in plain text."))
+            check("required forbids a plain-text reply", !required.contains("If no directive matches"))
+            check("required obligation comes last", required.hasSuffix("Do not reply in plain text."))
+            check("named function is the only one listed", named.contains("- search_notes") && !named.contains("- calendar_events"))
+            check("tools prompt never says it has no tools", !auto.contains("no tools"))
         }
 
         print("ProxySelfTest — message text is forwarded verbatim")

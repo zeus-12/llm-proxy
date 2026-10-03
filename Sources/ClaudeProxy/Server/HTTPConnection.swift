@@ -154,11 +154,7 @@ final class HTTPConnection {
 
         // Tool calling: a JSON-looking response must be inspected as a complete
         // envelope, but ordinary prose can still stream through immediately.
-        let toolsActive: Bool = {
-            guard let tools = decoded.tools, !tools.isEmpty else { return false }
-            if case .none? = decoded.tool_choice { return false }
-            return true
-        }()
+        let toolsActive = ClaudeBackend.functionsActive(tools: decoded.tools, toolChoice: decoded.tool_choice)
 
         guard let chatModel = ChatModel(rawValue: model), chatModel.backend == backend else {
             writeError(status: 400, message: "Unsupported model \(model)")
