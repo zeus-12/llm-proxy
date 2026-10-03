@@ -6,12 +6,13 @@ import Foundation
 /// profile that grants model-initiated commands no filesystem or network access.
 enum CodexBackend {
     private static let client = CodexAppServerClient()
-    /// Remove both command-execution implementations at process startup. The
-    /// permission profile and per-thread instructions remain independent layers.
+    /// Plugins go wholesale: disabling a plugin's MCP server by name creates an
+    /// entry with no transport, and Codex then refuses to load its config.
     static let disabledFeatureArguments = [
         "--disable", "shell_tool",
         "--disable", "unified_exec",
-        "--disable", "shell_zsh_fork"
+        "--disable", "shell_zsh_fork",
+        "--disable", "plugins"
     ]
 
     static func prepare() throws { try client.prepare() }
@@ -244,7 +245,7 @@ enum CodexBackend {
     fileprivate static func disabledMCPArguments(cli: ToolLocator.ResolvedCodex) throws -> [String] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: cli.codexPath)
-        process.arguments = ["mcp", "list", "--json"]
+        process.arguments = ["mcp", "list", "--json"] + disabledFeatureArguments
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = cli.path
         process.environment = environment

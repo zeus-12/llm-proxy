@@ -351,6 +351,8 @@ enum ProxySelfTest {
             check("Codex hosted web search enabled", config["web_search"] as? String == "live")
             check("Codex shell implementations disabled",
                   Set(CodexBackend.disabledFeatureArguments).isSuperset(of: ["shell_tool", "unified_exec"]))
+            check("Codex plugins are disabled",
+                  CodexBackend.disabledFeatureArguments.contains("plugins"))
         }
 
         print("ProxySelfTest — shared OpenAI wire format")
