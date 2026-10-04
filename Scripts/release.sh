@@ -55,4 +55,4 @@ echo "==> Pushing tag $TAG (this triggers the release build)"
 git push origin "$TAG"
 
 echo
-echo "Done. Watch the build: https://github.com/zeus-12/claude-proxy/actions"
+echo "Done. Watch the build: https://github.com/zeus-12/llm-proxy/actions"

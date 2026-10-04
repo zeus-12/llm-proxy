@@ -66,7 +66,7 @@ running** — the plugin connects to it. The popover shows the endpoint status.
 ## Install
 
 1. Download the latest `LLM-Proxy-<version>.zip` from the
-   [Releases](https://github.com/zeus-12/claude-proxy/releases) page.
+   [Releases](https://github.com/zeus-12/llm-proxy/releases) page.
 2. Unzip it and move **LLM Proxy.app** to `/Applications`.
 3. Open it the first time using **one of the two workarounds below**.
 4. It launches into the menu bar (no Dock icon) — click the icon to use it.
