@@ -36,6 +36,15 @@ enum APIDocs {
 
     // MARK: - Chat
 
+    private static let claudeOptionEntries = [
+        Entry(title: "Reasoning effort",
+              detail: "Optional `reasoning_effort`. `low`, `medium` and `high` set Claude Code's effort. `none` and `minimal` also drop the thinking parameter, which turns thinking off on models before the 5.5 family; the 5.5 models cannot turn thinking off, so they think briefly at low effort. Leave it out for Claude Code's default (medium).",
+              code: "{ \"reasoning_effort\": \"none\" }"),
+        Entry(title: "Keep warm",
+              detail: "Optional `keep_warm`. Keeps one started Claude Code process (about 230 MB) waiting for the next keep_warm request with the same model, effort and tools, which saves about half a second before the first token. The waiting process exits after five idle minutes.",
+              code: "{ \"keep_warm\": true }"),
+    ]
+
     static func chat(backend: ChatBackend, baseURL: String, keyRequired: Bool) -> Section {
         let providerModels = backend.models
         let models = backend.allowedIDs.joined(separator: ", ")
@@ -73,7 +82,9 @@ enum APIDocs {
                       detail: "Send messages in OpenAI Chat Completions format.",
                       code: "POST \(baseURL)/chat/completions"),
                 Entry(title: "Models",
-                      detail: "Use one of these exact model IDs.",
+                      detail: backend == .claude
+                        ? "These aliases always mean the newest model of each family. Any other Claude model ID, such as `claude-haiku-4-5`, is passed to the CLI as is; an unknown ID returns 404 `model_not_found`."
+                        : "These are the listed models. Any other model ID your Codex account offers is passed to Codex as is; an unknown ID returns 404 `model_not_found`.",
                       code: models),
                 Entry(title: "Streaming",
                       detail: "Set `stream` to true for SSE chunks ending with `[DONE]`.",
@@ -101,7 +112,7 @@ enum APIDocs {
                 Entry(title: "Browser clients",
                       detail: "Requests carrying an `Origin` header are refused with a 403 unless that origin is allowlisted, so a web page cannot spend your subscription. Clients that send no `Origin` are unaffected.",
                       code: "curl · OpenAI SDKs · native apps"),
-            ],
+            ] + (backend == .claude ? claudeOptionEntries : []),
             examples: [
                 Example(title: "curl", body: """
                 ```bash

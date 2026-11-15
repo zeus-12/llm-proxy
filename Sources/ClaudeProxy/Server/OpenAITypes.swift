@@ -146,18 +146,30 @@ struct ChatCompletionRequest: Decodable {
     let stream: Bool?
     let tools: [Tool]?
     let tool_choice: ToolChoice?
+    /// Claude only: OpenAI's `reasoning_effort`. Absent keeps the CLI default.
+    let reasoning_effort: String?
+    /// Claude only: keep a booted Claude CLI waiting for the next request.
+    let keep_warm: Bool?
 
     /// Semantic validation beyond what Codable enforces. Throws a
     /// `ProxyRequestError` (→ HTTP 400) with a precise, client-facing message.
-    func validate(allowedModels: [String] = ChatModel.allowedIDs) throws {
-        // `model` is required and must be one of the allowed models. Reject
-        // immediately so clients get a precise 400 instead of a silent default.
+    /// With `acceptsOtherModels`, a model id outside the list is passed to the
+    /// backend, which reports whether it exists. Another provider's alias is
+    /// still refused.
+    func validate(allowedModels: [String] = ChatModel.allowedIDs, acceptsOtherModels: Bool = false) throws {
         let allowed = allowedModels.joined(separator: ", ")
         guard let model, !model.trimmingCharacters(in: .whitespaces).isEmpty else {
             throw ProxyRequestError("`model` is required; allowed models: \(allowed)")
         }
-        guard allowedModels.contains(model) else {
-            throw ProxyRequestError("`model` \"\(model)\" is not supported; allowed models: \(allowed)")
+        if acceptsOtherModels {
+            guard allowedModels.contains(model)
+                    || (ChatModel(rawValue: model) == nil && Self.isPassableModelID(model)) else {
+                throw ProxyRequestError("`model` \"\(model)\" is not a valid model id for this endpoint")
+            }
+        } else {
+            guard allowedModels.contains(model) else {
+                throw ProxyRequestError("`model` \"\(model)\" is not supported; allowed models: \(allowed)")
+            }
         }
         guard !messages.isEmpty else {
             throw ProxyRequestError("`messages` must be a non-empty array")
@@ -197,6 +209,30 @@ struct ChatCompletionRequest: Decodable {
             }
         }
     }
+}
+
+extension ChatCompletionRequest {
+    /// A model id that can safely become the CLI's `--model` value: it cannot
+    /// start with `-`, so it is never read as a flag.
+    static func isPassableModelID(_ id: String) -> Bool {
+        id.count <= 128 && id.range(of: #"^[A-Za-z0-9][A-Za-z0-9._:\[\]-]*$"#, options: .regularExpression) != nil
+    }
+
+    var effort: ReasoningEffort? { reasoning_effort.flatMap(ReasoningEffort.init(rawValue:)) }
+
+    /// The Claude endpoint acts on `reasoning_effort`, so an unknown level is
+    /// an error there rather than silently ignored.
+    func validateClaudeOptions() throws {
+        if let reasoning_effort, ReasoningEffort(rawValue: reasoning_effort) == nil {
+            let levels = ReasoningEffort.allCases.map(\.rawValue).joined(separator: ", ")
+            throw ProxyRequestError("`reasoning_effort` must be one of \(levels) (got \"\(reasoning_effort)\")")
+        }
+    }
+}
+
+/// OpenAI's `reasoning_effort` levels.
+enum ReasoningEffort: String, CaseIterable, Sendable {
+    case off = "none", minimal, low, medium, high
 }
 
 struct ChatMessage: Decodable {
@@ -482,10 +518,12 @@ struct OpenAIError: Encodable {
     struct Body: Encodable {
         let message: String
         let type: String
+        let param: String?
+        let code: String?
     }
     let error: Body
-    init(_ message: String, type: String = "proxy_error") {
-        self.error = Body(message: message, type: type)
+    init(_ message: String, type: String = "proxy_error", param: String? = nil, code: String? = nil) {
+        self.error = Body(message: message, type: type, param: param, code: code)
     }
 }
 
