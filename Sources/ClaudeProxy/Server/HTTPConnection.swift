@@ -197,7 +197,8 @@ final class HTTPConnection {
         let decoded: ChatCompletionRequest
         do {
             decoded = try JSONDecoder().decode(ChatCompletionRequest.self, from: body)
-            try decoded.validate(allowedModels: backend.allowedIDs)
+            try decoded.validate(allowedModels: backend.allowedIDs, acceptsOtherModels: true)
+            if backend == .claude { try decoded.validateClaudeOptions() }
         } catch let e as ProxyRequestError {
             writeError(status: 400, message: e.message)
             return
@@ -218,27 +219,26 @@ final class HTTPConnection {
         let toolsActive = ClaudeBackend.functionsActive(tools: decoded.tools, toolChoice: decoded.tool_choice)
         let functionNames = Set(decoded.tools?.map(\.function.name) ?? [])
 
-        guard let chatModel = ChatModel(rawValue: model), chatModel.backend == backend else {
-            writeError(status: 400, message: "Unsupported model \(model)")
-            return
-        }
+        let cliModel = ChatModel(rawValue: model)?.cliAlias ?? model
 
         let result: ChatStreamResult
         do {
             switch backend {
             case .claude:
-                result = try ClaudeBackend.stream(model: chatModel.cliAlias,
+                result = try ClaudeBackend.stream(model: cliModel,
                                                   messages: decoded.messages,
                                                   tools: decoded.tools,
-                                                  toolChoice: decoded.tool_choice)
+                                                  toolChoice: decoded.tool_choice,
+                                                  reasoningEffort: decoded.effort,
+                                                  keepWarm: decoded.keep_warm ?? false)
             case .codex:
-                result = try CodexBackend.stream(model: chatModel.cliAlias,
+                result = try CodexBackend.stream(model: cliModel,
                                                  messages: decoded.messages,
                                                  tools: decoded.tools,
                                                  toolChoice: decoded.tool_choice)
             }
         } catch {
-            writeError(status: 502, message: error.localizedDescription)
+            writeBackendError(error)
             return
         }
 
@@ -261,9 +261,7 @@ final class HTTPConnection {
             do {
                 for try await delta in result.deltas { text += delta }
             } catch {
-                // Nothing has been written yet, so a normal error response is fine
-                // even if the client asked to stream.
-                writeError(status: 502, message: error.localizedDescription)
+                writeBackendError(error)
                 return
             }
             var splitter = DirectiveStreamSplitter(functionNames: functionNames)
@@ -291,20 +289,23 @@ final class HTTPConnection {
     private func streamToolAware(_ result: ChatStreamResult, model: String, functionNames: Set<String>) {
         let id = OpenAIIDs.chatID()
         let created = OpenAIIDs.now
-        writeRaw(status: 200, headers: sseHeaders, body: Data(), keepOpen: true)
 
         Task {
+            var deltas = result.deltas.makeAsyncIterator()
+            guard case .opened(let first) = await openStream(&deltas) else { return }
             sendChunk(id: id, created: created, model: model,
                       delta: .init(role: "assistant"), finish: nil)
 
             var splitter = DirectiveStreamSplitter(functionNames: functionNames)
             do {
-                for try await delta in result.deltas {
+                var next = first
+                while let delta = next {
                     let ready = splitter.feed(delta)
                     if !ready.isEmpty {
                         sendChunk(id: id, created: created, model: model,
                                   delta: .init(content: ready), finish: nil)
                     }
+                    next = try await deltas.next()
                 }
 
                 let (held, calls) = splitter.finish()
@@ -345,14 +346,16 @@ final class HTTPConnection {
     private func streamChat(_ result: ChatStreamResult, model: String) {
         let id = OpenAIIDs.chatID()
         let created = OpenAIIDs.now
-        writeRaw(status: 200, headers: sseHeaders, body: Data(), keepOpen: true)
 
         Task {
-            // First chunk announces the assistant role.
+            var deltas = result.deltas.makeAsyncIterator()
+            guard case .opened(let first) = await openStream(&deltas) else { return }
             sendChunk(id: id, created: created, model: model, role: "assistant", content: nil, finish: nil)
             do {
-                for try await delta in result.deltas {
+                var next = first
+                while let delta = next {
                     sendChunk(id: id, created: created, model: model, role: nil, content: delta, finish: nil)
+                    next = try await deltas.next()
                 }
                 sendChunk(id: id, created: created, model: model, role: nil, content: nil, finish: "stop")
             } catch {
@@ -367,6 +370,35 @@ final class HTTPConnection {
             conn.send(content: Data("data: [DONE]\n\n".utf8), completion: .contentProcessed { [weak self] _ in
                 self?.close()
             })
+        }
+    }
+
+    /// Holds the SSE headers until the backend produces its first delta or
+    /// fails, so a failure before any output (an unknown model) still gets a
+    /// real HTTP status.
+    private func openStream(_ deltas: inout AsyncThrowingStream<String, Error>.Iterator) async -> StreamStart {
+        let first: String?
+        do {
+            first = try await deltas.next()
+        } catch {
+            writeBackendError(error)
+            return .failed
+        }
+        writeRaw(status: 200, headers: sseHeaders, body: Data(), keepOpen: true)
+        return .opened(first: first)
+    }
+
+    private enum StreamStart {
+        case failed
+        case opened(first: String?)
+    }
+
+    private func writeBackendError(_ error: Error) {
+        if case BackendError.modelNotFound(let message)? = error as? BackendError {
+            writeEncodable(status: 404, OpenAIError(message, type: "invalid_request_error",
+                                                    param: "model", code: "model_not_found"))
+        } else {
+            writeError(status: 502, message: error.localizedDescription)
         }
     }
 
@@ -397,7 +429,7 @@ final class HTTPConnection {
             do {
                 for try await delta in result.deltas { text += delta }
             } catch {
-                writeError(status: 502, message: error.localizedDescription)
+                writeBackendError(error)
                 return
             }
             let response = ChatCompletionResponse(

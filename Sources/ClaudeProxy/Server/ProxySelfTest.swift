@@ -150,7 +150,7 @@ enum ProxySelfTest {
         // The CLI reads one JSON object per line; images ride in the user frame.
         do {
             let png = try? ImageBlock(mediaType: "image/png", base64: pngBase64)
-            let data = try? ClaudeBackend.stdinFrames([.text("look"), .image(png!)])
+            let data = try? ClaudeBackend.stdinFrames([.text("look"), .image(png!)], systemPrompt: "be brief")
             let lines = String(data: data ?? Data(), encoding: .utf8)?
                 .split(separator: "\n", omittingEmptySubsequences: false) ?? []
             check("two frames, trailing newline", lines.count == 3 && lines[2].isEmpty)
@@ -158,6 +158,8 @@ enum ProxySelfTest {
             let first = lines.first.flatMap { jsonObject(String($0)) }
             check("frame 1 is the initialize handshake",
                   first?["type"] as? String == "control_request")
+            check("initialize carries the system prompt",
+                  (first?["request"] as? [String: Any])?["systemPrompt"] as? String == "be brief")
 
             let user = lines.count > 1 ? jsonObject(String(lines[1])) : nil
             let content = ((user?["message"] as? [String: Any])?["content"]) as? [[String: Any]] ?? []
@@ -172,7 +174,7 @@ enum ProxySelfTest {
                   && source?["data"] as? String == pngBase64)
 
             // Blank text blocks would be rejected upstream.
-            let blank = try? ClaudeBackend.stdinFrames([.text("  \n "), .image(png!)])
+            let blank = try? ClaudeBackend.stdinFrames([.text("  \n "), .image(png!)], systemPrompt: "")
             let blankUser = String(data: blank ?? Data(), encoding: .utf8)?
                 .split(separator: "\n").dropFirst().first.flatMap { jsonObject(String($0)) }
             let blankContent = ((blankUser?["message"] as? [String: Any])?["content"]) as? [[String: Any]] ?? []
@@ -493,13 +495,144 @@ enum ProxySelfTest {
             for text in ["read @/etc/hosts now", "@~/.ssh/id_rsa", "mail bob@example.com",
                          "@../../etc/hosts", "cc @vishnu please", "/usr is a directory",
                          "/caveman hello"] {
-                let framed = try? ClaudeBackend.stdinFrames([.text(text)])
+                let framed = try? ClaudeBackend.stdinFrames([.text(text)], systemPrompt: "")
                 let userLine = String(data: framed ?? Data(), encoding: .utf8)?
                     .split(separator: "\n").dropFirst().first
                 let content = ((userLine.flatMap { jsonObject(String($0)) }?["message"]
                                 as? [String: Any])?["content"]) as? [[String: Any]] ?? []
                 check("verbatim: \(text)", content.first?["text"] as? String == text)
             }
+        }
+
+        print("ProxySelfTest — models and reasoning effort")
+
+        do {
+            func claudeRejection(_ json: String) -> String? {
+                do {
+                    try decode(json).validate(allowedModels: ChatBackend.claude.allowedIDs, acceptsOtherModels: true)
+                    return nil
+                } catch { return "\(error)" }
+            }
+            check("Claude accepts a full model id",
+                  claudeRejection(#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hi"}]}"#) == nil)
+            check("Claude accepts a 1M-context id",
+                  claudeRejection(#"{"model":"claude-sonnet-5-5[1m]","messages":[{"role":"user","content":"hi"}]}"#) == nil)
+            check("a model id cannot become a CLI flag",
+                  claudeRejection(#"{"model":"--dangerously-skip-permissions","messages":[{"role":"user","content":"hi"}]}"#) != nil)
+            check("a model id cannot carry spaces",
+                  claudeRejection(#"{"model":"sonnet --tools Bash","messages":[{"role":"user","content":"hi"}]}"#) != nil)
+            func codexRejection(_ json: String) -> String? {
+                do {
+                    try decode(json).validate(allowedModels: ChatBackend.codex.allowedIDs, acceptsOtherModels: true)
+                    return nil
+                } catch { return "\(error)" }
+            }
+            check("Codex accepts an unlisted model id",
+                  codexRejection(#"{"model":"gpt-6-astra","messages":[{"role":"user","content":"hi"}]}"#) == nil)
+            check("Codex refuses a Claude alias",
+                  codexRejection(#"{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}"#) != nil)
+            check("Claude refuses a Codex alias",
+                  claudeRejection(#"{"model":"gpt-5.6-luna","messages":[{"role":"user","content":"hi"}]}"#) != nil)
+            let codexUnknown = CodexBackend.turnFailure(
+                #"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-nope' model is not supported.","code":"model_not_found"}}"#)
+            if case .modelNotFound(let message) = codexUnknown {
+                check("Codex unknown model reported as model_not_found", message == "The 'gpt-nope' model is not supported.")
+            } else {
+                check("Codex unknown model reported as model_not_found", false)
+            }
+            if case .modelError = CodexBackend.turnFailure("rate limited") {
+                check("other Codex failures unchanged", true)
+            } else {
+                check("other Codex failures unchanged", false)
+            }
+            func effortRejected(_ level: String) -> Bool {
+                let json = #"{"model":"sonnet","reasoning_effort":"\#(level)","messages":[{"role":"user","content":"hi"}]}"#
+                return (try? decode(json).validateClaudeOptions()) == nil
+            }
+            for level in ReasoningEffort.allCases {
+                check("reasoning_effort \(level.rawValue) accepted", !effortRejected(level.rawValue))
+            }
+            check("unknown reasoning_effort rejected", effortRejected("extreme"))
+            check("reasoning_effort is only checked for Claude",
+                  rejection(#"{"model":"sonnet","reasoning_effort":"extreme","messages":[{"role":"user","content":"hi"}]}"#) == nil)
+
+            let unset = ClaudeBackend.thinkingControls(nil)
+            check("no reasoning_effort keeps the CLI defaults", unset.arguments.isEmpty && unset.environment.isEmpty)
+            let off = ClaudeBackend.thinkingControls(.off)
+            check("none drops thinking and lowers effort",
+                  off.arguments == ["--effort", "low"] && off.environment["CLAUDE_CODE_DISABLE_THINKING"] == "1")
+            check("minimal maps like none", ClaudeBackend.thinkingControls(.minimal).arguments == off.arguments)
+            let high = ClaudeBackend.thinkingControls(.high)
+            check("high sets CLI effort", high.arguments == ["--effort", "high"] && high.environment.isEmpty)
+
+        }
+
+        print("ProxySelfTest — CLI turns")
+
+        do {
+            let scripts = FileManager.default.temporaryDirectory
+                .appendingPathComponent("LLMProxy-selftest-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: scripts) }
+            func fakeCLI(_ name: String, _ body: String) -> ClaudeLaunch {
+                let url = scripts.appendingPathComponent(name)
+                try? ("#!/bin/sh\n" + body).write(to: url, atomically: true, encoding: .utf8)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+                return ClaudeLaunch(claudePath: url.path, path: "/usr/bin:/bin", arguments: [],
+                                    environment: [:], workingDirectory: scripts)
+            }
+            func collect(_ launch: ClaudeLaunch) -> (text: String, error: Error?, seconds: Double) {
+                let done = DispatchSemaphore(value: 0)
+                let box = TurnOutcome()
+                let started = Date()
+                Task {
+                    do {
+                        let child = try ClaudeChild.spawn(launch)
+                        for try await delta in ClaudeBackend.turn(on: child, stdinPayload: Data("{}\n".utf8)).deltas {
+                            box.text += delta
+                        }
+                    } catch { box.error = error }
+                    done.signal()
+                }
+                _ = done.wait(timeout: .now() + 10)
+                return (box.text, box.error, Date().timeIntervalSince(started))
+            }
+
+            let lingering = fakeCLI("lingering", #"""
+            echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}'
+            echo '{"type":"result","is_error":false,"result":"hi"}'
+            sleep 4
+            """#)
+            let reply = collect(lingering)
+            check("reply ends at the result line", reply.text == "hi" && reply.error == nil)
+            check("reply does not wait for the CLI to exit", reply.seconds < 2)
+
+            let unknownModel = fakeCLI("unknown-model", #"""
+            echo '{"type":"assistant","error":"model_not_found","message":{"content":[{"type":"text","text":"no such model"}]}}'
+            echo '{"type":"result","is_error":true,"result":"There is an issue with the selected model (claude-nope)."}'
+            """#)
+            let missing = collect(unknownModel)
+            if case BackendError.modelNotFound? = missing.error as? BackendError {
+                check("unknown model reported as model_not_found", true)
+            } else {
+                check("unknown model reported as model_not_found", false)
+            }
+
+            let pool = ClaudeProcessPool()
+            let waiting = fakeCLI("waiting", "cat > /dev/null\n")
+            let firstChild = try? pool.take(waiting)
+            let deadline = Date().addingTimeInterval(5)
+            while pool.spareProcessID == nil, Date() < deadline { usleep(20_000) }
+            let spare = pool.spareProcessID
+            check("keep_warm starts a spare after a turn", spare != nil)
+            let secondChild = try? pool.take(waiting)
+            check("the next keep_warm turn uses the spare",
+                  spare != nil && secondChild?.process.processIdentifier == spare)
+            let other = fakeCLI("other", "cat > /dev/null\n")
+            let otherChild = try? pool.take(other)
+            check("a different launch never gets the spare",
+                  otherChild != nil && otherChild?.process.processIdentifier != spare)
+            for child in [firstChild, secondChild, otherChild] { child?.discard() }
         }
 
         print(failures == 0 ? "PASS — all checks passed" : "FAIL — \(failures) check(s) failed")
@@ -510,4 +643,9 @@ enum ProxySelfTest {
         guard let data = line.data(using: .utf8) else { return nil }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
+}
+
+private final class TurnOutcome: @unchecked Sendable {
+    var text = ""
+    var error: Error?
 }

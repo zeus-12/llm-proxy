@@ -5,8 +5,8 @@ import Foundation
 ///
 /// Honesty notes baked into the design:
 ///  - We fully override the system prompt so the Claude Code agent persona is
-///    replaced by a plain-assistant prompt. We cannot remove the ~12k tokens of
-///    cached harness context, so every call has that input-token floor.
+///    replaced by a plain-assistant prompt. We cannot remove the CLI's own
+///    context (about 600 tokens), so every call has that input-token floor.
 ///  - The CLI is locked down to a plain text generator: no tools, no MCP
 ///    servers, no skills, no user settings, and a scratch working directory. A
 ///    chat proxy must never let a caller read files or run commands on the host.
@@ -305,106 +305,87 @@ enum ClaudeBackend {
         return s
     }
 
-    /// Launch the CLI and stream text deltas. Throws if `claude` can't be found
-    /// or the process fails before producing output.
+    /// Run one turn on a `claude` child and stream text deltas. Throws if
+    /// `claude` can't be found or the process fails before producing output.
     static func stream(model: String, messages: [ChatMessage],
-                       tools: [Tool]? = nil, toolChoice: ToolChoice? = nil) throws -> ChatStreamResult {
+                       tools: [Tool]? = nil, toolChoice: ToolChoice? = nil,
+                       reasoningEffort: ReasoningEffort? = nil,
+                       keepWarm: Bool = false) throws -> ChatStreamResult {
         guard let cli = ToolLocator.resolve() else {
             throw BackendError.claudeNotFound
         }
         let (system, blocks) = buildPrompt(messages, tools: tools, toolChoice: toolChoice)
-        let stdinPayload = try stdinFrames(blocks)
+        let stdinPayload = try stdinFrames(blocks, systemPrompt: system)
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: cli.claudePath)
-        process.arguments = [
-            "-p",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--include-partial-messages",
-            "--verbose",
-            "--model", model,
-            "--system-prompt", system
-        ] + isolationArguments(allowing: allowedTools(
-            callerHasFunctions: functionsActive(tools: tools, toolChoice: toolChoice)))
+        let thinking = thinkingControls(reasoningEffort)
+        let launch = ClaudeLaunch(
+            claudePath: cli.claudePath,
+            path: cli.path,
+            arguments: [
+                "-p",
+                "--input-format", "stream-json",
+                "--output-format", "stream-json",
+                "--include-partial-messages",
+                "--verbose",
+                "--model", model
+            ] + thinking.arguments + isolationArguments(allowing: allowedTools(
+                callerHasFunctions: functionsActive(tools: tools, toolChoice: toolChoice))),
+            environment: thinking.environment,
+            workingDirectory: workingDirectory())
+        let child = keepWarm ? try ClaudeProcessPool.shared.take(launch) : try ClaudeChild.spawn(launch)
+        return turn(on: child, stdinPayload: stdinPayload)
+    }
 
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = cli.path             // so claude can find node
-        // Stops the CLI building a file attachment out of an `@path` in message
-        // text at all, rather than letting one be built and then refused.
-        env["CLAUDE_CODE_DISABLE_ATTACHMENTS"] = "1"
-        process.environment = env
-        process.currentDirectoryURL = workingDirectory()
-
-        // Set before run() so an immediate exit cannot be missed.
-        let exit = ProcessExit()
-        process.terminationHandler = { exit.finish($0.terminationStatus) }
-
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        let stderrLog = OutputBuffer()
-        let stdinPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-        process.standardInput = stdinPipe
-
-        try process.run()
-
-        // Drain stderr for the life of the process. Reading it only after exit
-        // deadlocks the turn: once the child fills the 64 KB pipe buffer it blocks
-        // on write, stops producing stdout, and we wait forever on output that
-        // will never come.
-        let stderrHandle = stderrPipe.fileHandleForReading
-        stderrHandle.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            stderrLog.append(chunk)
-        }
+    /// Feeds one turn to a running child and streams its text deltas. The
+    /// stream ends at the CLI's result line, not when the process exits.
+    static func turn(on child: ClaudeChild, stdinPayload: Data) -> ChatStreamResult {
+        let process = child.process
 
         // Off the caller's thread: a multi-megabyte image payload will not fit in
         // the pipe buffer, so writing inline blocks until the child drains stdin
         // while the child can be blocked writing stdout that nobody is reading.
         // A failed write leaves the child with a short turn, which it reports
         // itself on stdout.
-        let stdin = stdinPipe.fileHandleForWriting
+        let stdin = child.stdin
         DispatchQueue.global(qos: .userInitiated).async {
             try? stdin.write(contentsOf: stdinPayload)
             try? stdin.close()
         }
 
+        let turn = TurnState()
         let stream = AsyncThrowingStream<String, Error> { continuation in
             let task = Task {
                 do {
                     var sawText = false
-                    var resultText: String?
-                    for try await line in stdoutPipe.fileHandleForReading.bytes.lines {
+                    var apiErrorCode: String?
+                    for try await line in child.stdout.bytes.lines {
+                        if let code = Self.apiErrorCode(fromLine: line) { apiErrorCode = code }
                         if let text = Self.textDelta(fromLine: line) {
                             sawText = true
                             continuation.yield(text)
                         }
+                        // The result line ends the turn. The CLI then spends about
+                        // a second shutting down, which the caller must not wait on.
                         if let text = Self.successResult(fromLine: line) {
-                            resultText = text
+                            turn.complete()
+                            // The CLI answers some turns itself, with a synthetic
+                            // message and no deltas. Report what it said rather
+                            // than a blank completion that reads as success.
+                            if !sawText, !text.isEmpty { continuation.yield(text) }
+                            continuation.finish()
+                            return
                         }
                         if let errMessage = Self.errorResult(fromLine: line) {
-                            continuation.finish(throwing: BackendError.modelError(errMessage))
+                            continuation.finish(throwing: apiErrorCode == "model_not_found"
+                                ? BackendError.modelNotFound(errMessage)
+                                : BackendError.modelError(errMessage))
                             process.terminate()
                             return
                         }
                     }
-                    let status = await exit.value()
-                    // The CLI answers some turns itself, with a synthetic message
-                    // and no deltas. Report what it said rather than an empty
-                    // completion that reads as a successful blank answer.
-                    if !sawText, status == 0, let resultText, !resultText.isEmpty {
-                        continuation.yield(resultText)
-                        continuation.finish()
-                        return
-                    }
+                    let status = await child.exit.value()
                     if !sawText && status != 0 {
-                        let msg = String(data: stderrLog.value, encoding: .utf8)?
+                        let msg = String(data: child.stderrLog.value, encoding: .utf8)?
                             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                         continuation.finish(throwing: BackendError.modelError(
                             msg.isEmpty ? "claude exited with status \(status)" : msg))
@@ -417,7 +398,8 @@ enum ClaudeBackend {
             }
             continuation.onTermination = { _ in
                 task.cancel()
-                stderrHandle.readabilityHandler = nil
+                if turn.isComplete { return }
+                child.stopReadingStderr()
                 if process.isRunning { process.terminate() }
             }
         }
@@ -425,11 +407,11 @@ enum ClaudeBackend {
         return ChatStreamResult(deltas: stream)
     }
 
-    /// The two stdin lines for one turn: the Agent SDK's initialize handshake,
-    /// then the user message. The handshake is what the SDK sends; images are
-    /// delivered with or without it on CLI 2.1.220, so it is parity rather than a
-    /// load-bearing step.
-    static func stdinFrames(_ blocks: [PromptBlock]) throws -> Data {
+    /// The two stdin lines for one turn: the initialize handshake carrying the
+    /// system prompt, then the user message. The prompt rides in the handshake
+    /// rather than `--system-prompt` so a child can be launched before the
+    /// request arrives.
+    static func stdinFrames(_ blocks: [PromptBlock], systemPrompt: String) throws -> Data {
         var content: [[String: Any]] = blocks.compactMap { block in
             switch block {
             case .text(let text):
@@ -450,14 +432,18 @@ enum ClaudeBackend {
         // An empty turn is the CLI's error to report, not ours to invent.
         if content.isEmpty { content = [["type": "text", "text": ""]] }
 
-
+        let initialize: [String: Any] = [
+            "request_id": "init",
+            "type": "control_request",
+            "request": ["subtype": "initialize", "systemPrompt": systemPrompt]
+        ]
         let userFrame: [String: Any] = [
             "type": "user",
             "message": ["role": "user", "content": content],
             "parent_tool_use_id": NSNull()
         ]
 
-        var data = Data(#"{"request_id":"init","type":"control_request","request":{"subtype":"initialize"}}"#.utf8)
+        var data = try JSONSerialization.data(withJSONObject: initialize)
         data.append(0x0A)
         data.append(try JSONSerialization.data(withJSONObject: userFrame))
         data.append(0x0A)
@@ -476,6 +462,28 @@ enum ClaudeBackend {
             return nil
         }
         return text
+    }
+
+    /// The CLI's code for an API failure, carried on the synthetic assistant
+    /// message it writes before the error result (e.g. `model_not_found`).
+    private static func apiErrorCode(fromLine line: String) -> String? {
+        guard let obj = jsonObject(line), obj["type"] as? String == "assistant" else { return nil }
+        return obj["error"] as? String
+    }
+
+    /// How `reasoning_effort` reaches the CLI. Nil keeps the CLI's defaults.
+    /// The CLI has no switch that sends `thinking: disabled`: the environment
+    /// variable drops the thinking parameter, which turns thinking off on models
+    /// before the 5.5 family, while the 5.5 models still think adaptively when it
+    /// is absent, so `--effort low` is what shortens their thinking.
+    static func thinkingControls(_ effort: ReasoningEffort?) -> (arguments: [String], environment: [String: String]) {
+        guard let effort else { return ([], [:]) }
+        switch effort {
+        case .off, .minimal:
+            return (["--effort", "low"], ["CLAUDE_CODE_DISABLE_THINKING": "1"])
+        case .low, .medium, .high:
+            return (["--effort", effort.rawValue], [:])
+        }
     }
 
     /// The text of a successful terminal `result` line.
@@ -504,61 +512,22 @@ enum ClaudeBackend {
     }
 }
 
-/// Awaits a child process's exit status without blocking a thread.
-///
-/// `Process.waitUntilExit()` cannot be used here: it blocks, and called from a
-/// Swift concurrency task it occupies a cooperative-pool thread. It was also
-/// observed hanging permanently on an already-reaped child — roughly one request
-/// in twenty never returned, leaving the caller waiting on a response forever.
-private final class ProcessExit: @unchecked Sendable {
+/// Set once a turn's result line arrives; after that the child is left to
+/// exit on its own instead of being killed when the caller stops reading.
+private final class TurnState: @unchecked Sendable {
     private let lock = NSLock()
-    private var status: Int32?
-    private var waiter: CheckedContinuation<Int32, Never>?
+    private var completed = false
 
-    func finish(_ value: Int32) {
-        lock.lock()
-        guard status == nil else { lock.unlock(); return }
-        status = value
-        let pending = waiter
-        waiter = nil
-        lock.unlock()
-        pending?.resume(returning: value)
-    }
+    func complete() { lock.lock(); completed = true; lock.unlock() }
 
-    func value() async -> Int32 {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if let status {
-                lock.unlock()
-                continuation.resume(returning: status)
-            } else {
-                waiter = continuation
-                lock.unlock()
-            }
-        }
-    }
-}
-
-/// Accumulates a child process's output from the pipe's read queue.
-private final class OutputBuffer: @unchecked Sendable {
-    private let lock = NSLock()
-    private var data = Data()
-
-    func append(_ chunk: Data) {
-        lock.lock(); defer { lock.unlock() }
-        data.append(chunk)
-    }
-
-    var value: Data {
-        lock.lock(); defer { lock.unlock() }
-        return data
-    }
+    var isComplete: Bool { lock.lock(); defer { lock.unlock() }; return completed }
 }
 
 enum BackendError: LocalizedError {
     case claudeNotFound
     case codexNotFound
     case modelError(String)
+    case modelNotFound(String)
 
     var errorDescription: String? {
         switch self {
@@ -566,7 +535,7 @@ enum BackendError: LocalizedError {
             return "Could not find the `claude` CLI on your login PATH. Make sure Claude Code is installed and logged in."
         case .codexNotFound:
             return "Could not find the `codex` CLI. Install Codex or the ChatGPT desktop app, then sign in."
-        case .modelError(let m):
+        case .modelError(let m), .modelNotFound(let m):
             return m
         }
     }

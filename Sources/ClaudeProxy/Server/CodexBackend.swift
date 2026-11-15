@@ -361,6 +361,18 @@ enum CodexBackend {
         return error["message"] as? String ?? "Codex app-server request failed"
     }
 
+    /// Codex carries the upstream API error as JSON inside its message string;
+    /// an unknown model is reported there with code `model_not_found`.
+    static func turnFailure(_ message: String) -> BackendError {
+        guard let data = message.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let upstream = object["error"] as? [String: Any],
+              upstream["code"] as? String == "model_not_found" else {
+            return .modelError(message)
+        }
+        return .modelNotFound(upstream["message"] as? String ?? message)
+    }
+
     fileprivate static func nestedMessage(_ object: [String: Any]) -> String? {
         if let message = object["message"] as? String { return message }
         if let error = object["error"] as? [String: Any] {
@@ -564,7 +576,7 @@ private final class CodexAppServerClient: @unchecked Sendable {
         case "turn/completed":
             let turn = params["turn"] as? [String: Any]
             if turn?["status"] as? String == "completed" { finish(call, error: nil) }
-            else { finish(call, error: BackendError.modelError(turn.flatMap(CodexBackend.nestedMessage) ?? call.pendingError ?? "Codex turn failed")) }
+            else { finish(call, error: CodexBackend.turnFailure(turn.flatMap(CodexBackend.nestedMessage) ?? call.pendingError ?? "Codex turn failed")) }
         default: break
         }
     }

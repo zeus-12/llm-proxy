@@ -116,8 +116,12 @@ In any OpenAI-compatible client, choose one provider:
 
 | Provider | Base URL | API key | Models |
 | --- | --- | --- | --- |
-| Claude | `http://127.0.0.1:8787/v1` | Optional | `sonnet`, `opus`, `haiku` |
-| Codex | `http://127.0.0.1:17878/v1` | Optional | supported GPT-5.6 ids |
+| Claude | `http://127.0.0.1:8787/v1` | Optional | `sonnet`, `opus`, `haiku`, or any Claude model id |
+| Codex | `http://127.0.0.1:17878/v1` | Optional | supported GPT-5.6 ids, or any model id your Codex account offers |
+
+The aliases always mean the newest model of each family. Any other model id is
+passed to the CLI as is, and an id that doesn't exist returns HTTP 404 with
+`"code": "model_not_found"`.
 
 ### Try it with curl
 
@@ -137,6 +141,27 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{
     "model": "sonnet",
     "messages": [{"role": "user", "content": "Give me three names for a coffee shop."}]
+  }'
+```
+
+#### Claude request options
+
+Two optional request fields apply to the Claude endpoint only.
+
+| Field | Values | Effect |
+| --- | --- | --- |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high` | `low`/`medium`/`high` set Claude Code's `--effort`. `none`/`minimal` also drop the thinking parameter: models before the 5.5 family then don't think at all, while the 5.5 models (which can't turn thinking off) think briefly at low effort. Left out, Claude Code's default applies (medium). |
+| `keep_warm` | `true` | Keeps one started Claude Code process waiting for the next `keep_warm` request with the same model, effort and tools, which saves about half a second before the first token. It costs about 230 MB while it waits and exits after five idle minutes. |
+
+```bash
+curl -N http://127.0.0.1:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "haiku",
+    "stream": true,
+    "reasoning_effort": "none",
+    "keep_warm": true,
+    "messages": [{"role": "user", "content": "Say hi."}]
   }'
 ```
 
